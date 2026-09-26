@@ -1343,6 +1343,68 @@ def _live_send_media(
         delivery_errors.append(f"{_me} (target {t.where})")
 
 
+def _cron_wake_requested(job: dict) -> bool:
+    """Whether a cron delivery should give the target session a REAL turn (a synthetic
+    ``gateway.wake.deliver_wake`` handoff) instead of only mirroring the output into its
+    transcript for the next natural turn to discover. Opt-in, strict ``True`` — unlike
+    ``attach_to_session`` this has no legacy global-config fallback: a job that wants to interrupt
+    a live human session says so explicitly, and a stray truthy non-bool in hand-edited jobs.json
+    must never silently opt a job into that."""
+    return job.get("wake_on_alert") is True
+
+
+def _maybe_wake_cron_target(
+    job: dict, platform_name: str, chat_id: str, wake_text: str, *, thread_id: Optional[str] = None,
+    user_id: Optional[str] = None, adapter: Any = None, loop: Any = None,
+) -> bool:
+    """Best-effort: give the target session a REAL turn via ``gateway.wake.deliver_wake`` instead
+    of a passive transcript mirror — the whole point of ``wake_on_alert`` is that the owner sees
+    it NOW, as an actual agent turn, not only if/when they happen to send another message later.
+
+    Requires a live, push-capable adapter and a running gateway loop (the hosted-gateway lane);
+    a non-push adapter (stateless API server) would need the raw gateway session id, which cron
+    jobs never carry, so that lane is out of scope here. Returns False on anything short of a
+    confirmed wake (no adapter/loop, empty text, non-push adapter, ``WakeNotAccepted``, or any
+    other exception) so the caller degrades to the existing passive mirror — this can only ever be
+    additive, never a new way to lose a cron delivery.
+    """
+    text = (wake_text or "").strip()
+    if not text or adapter is None or loop is None or not getattr(loop, "is_running", lambda: False)():
+        return False
+    from gateway.wake import WAKE_TURN_TIMEOUT_SECONDS, WakeNotAccepted, adapter_supports_push, deliver_wake
+    if not adapter_supports_push(adapter):
+        return False
+    from agent.async_utils import safe_schedule_threadsafe
+    from gateway.config import Platform
+    from gateway.session import SessionSource
+    try:
+        platform_enum = Platform(platform_name.lower())
+    except (ValueError, KeyError):
+        return False
+    source = SessionSource(
+        platform=platform_enum, chat_id=str(chat_id), thread_id=thread_id, user_id=user_id)
+    try:
+        coro = deliver_wake(adapter, text=_cron_mirror_message(job, text), source=source)
+        future = safe_schedule_threadsafe(coro, loop)
+        if future is None:
+            return False
+        future.result(timeout=WAKE_TURN_TIMEOUT_SECONDS)
+    except WakeNotAccepted as e:
+        logger.warning(
+            "Job '%s': wake not accepted for %s:%s (%s) — falling back to transcript mirror",
+            job.get("id", "?"), platform_name, chat_id, e)
+        return False
+    except Exception as e:
+        logger.warning(
+            "Job '%s': wake_on_alert delivery failed for %s:%s: %s — falling back to transcript "
+            "mirror", job.get("id", "?"), platform_name, chat_id, e)
+        return False
+    logger.info(
+        "Job '%s': woke %s:%s with a real agent turn (wake_on_alert)",
+        job.get("id", "?"), platform_name, chat_id)
+    return True
+
+
 def _seed_live_delivery_sessions(t: _TargetDelivery, delivered_message_id) -> None:
     """After a confirmed live send, seed continuation session(s) and run the generic mirror.
     Thread seeding is deferred here so open-succeeds/deliver-fails never seeds an unseen brief."""
@@ -1386,10 +1448,24 @@ def _seed_live_delivery_sessions(t: _TargetDelivery, delivered_message_id) -> No
             "skipped; the plain mirror below may still apply",
             job["id"], t.platform_name, t.chat_id,
             origin.get("platform"), origin.get("chat_id"), origin.get("thread_id"))
+    # wake_on_alert: give the target a REAL turn instead of the passive mirror. Unlike the mirror
+    # (which needs origin/home/attach_to_session eligibility so a global flag can't write
+    # transcripts into arbitrary chats), `wake_on_alert: true` IS itself the per-job explicit
+    # consent — the estate's alert-worthy cron jobs deliberately address the owner's DM/group via
+    # an EXPLICIT `platform:chat_id` (shared/claude-plugins#894 routing ruling), which is never
+    # mirror-eligible without ALSO setting attach_to_session. Requiring both would silently disable
+    # wake for exactly the jobs it exists for. So wake checks only its own flag; when a wake also
+    # lands on a mirror-eligible target, the passive mirror below is redundant and skipped. A
+    # failed/unavailable wake (no push adapter, no running loop, WakeNotAccepted, any other error)
+    # falls through to the mirror unchanged (when the target is mirror-eligible) — this can only
+    # add a delivery path, never remove the existing one.
+    woke = _cron_wake_requested(job) and _maybe_wake_cron_target(
+        job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.thread_id,
+        user_id=t.origin_user_id, adapter=t.runtime_adapter, loop=t.loop)
     _maybe_mirror_cron_delivery(
         job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.thread_id,
         user_id=t.origin_user_id,
-        enabled=t.mirror_this_target and not thread_seeded and not inchannel_seeded)
+        enabled=t.mirror_this_target and not thread_seeded and not inchannel_seeded and not woke)
 
 
 def _deliver_via_live_adapter(
