@@ -1105,6 +1105,12 @@ class _TargetDelivery:
     inchannel_continuable: bool
     opened_thread_id: Optional[str]
     live_adapter_ready: bool = False
+    # ``target["_resolved_from"]`` verbatim (see _resolve_single_delivery_target): "origin",
+    # "origin_fallback", "home", "explicit", or None for an untagged broadcast (`all`) expansion
+    # member. Used ONLY to gate wake_on_alert against broadcast fan-out — never both a per-target
+    # mirror concern (that stays on mirror_this_target/origin_target) and a wake concern in the
+    # same flag, so the two eligibility checks can't silently drift into each other.
+    resolved_from: Optional[str] = None
 
     @property
     def is_relay(self) -> bool:
@@ -1353,56 +1359,67 @@ def _cron_wake_requested(job: dict) -> bool:
     return job.get("wake_on_alert") is True
 
 
+def _wake_target_eligible(resolved_from: Optional[str], origin_target: bool) -> bool:
+    """Whether a specific TARGET may be woken, independent of whether the JOB opted in.
+
+    ``wake_on_alert: true`` is per-job consent to interrupt the owner's live session — but a job
+    can still resolve to MULTIPLE targets (an explicit multi-platform ``deliver`` list, or the
+    ``all`` broadcast token expanding to every configured home channel). Waking every one of those
+    recipients for a single alert was the real gap an independent review caught (round 1 of
+    ahmednfwela/hermes-agent#3): nothing stopped ``deliver: all`` + ``wake_on_alert: true`` from
+    opening a real turn on every platform the estate has a home channel for.
+
+    Eligible: the true origin conversation (``origin_target``), OR any target carrying explicit
+    resolution provenance (``origin``, ``origin_fallback``, ``home``, ``explicit`` —
+    ``_resolve_single_delivery_target``'s tags). NOT eligible: a target with no provenance tag,
+    which is exactly an untagged broadcast (`all`) expansion member — the one shape
+    ``_target_mirror_eligible`` already refuses to mirror for the identical reason, applied here to
+    wake instead."""
+    return origin_target or resolved_from is not None
+
+
 def _maybe_wake_cron_target(
     job: dict, platform_name: str, chat_id: str, wake_text: str, *, thread_id: Optional[str] = None,
     user_id: Optional[str] = None, adapter: Any = None, loop: Any = None,
 ) -> bool:
-    """Best-effort: give the target session a REAL turn via ``gateway.wake.deliver_wake`` instead
-    of a passive transcript mirror — the whole point of ``wake_on_alert`` is that the owner sees
-    it NOW, as an actual agent turn, not only if/when they happen to send another message later.
+    """Best-effort: give the target session a REAL turn via the C2 event router
+    (``gateway.event_router.route_event``, shared/claude-plugins#1040) instead of a passive
+    transcript mirror — but only when THIS delivery's actual content classifies as ALARM.
+    ``wake_on_alert: true`` marks a job alert-CAPABLE (keeps classification cost bounded — a
+    job that never opts in is never even classified); the router decides, per firing, whether
+    THIS text warrants interrupting a live human (jev-first, per the owner's classification
+    ruling; a small deterministic keyword rule is the counted, logged fail-open path — see
+    ``gateway.event_router`` for the full contract).
 
     Requires a live, push-capable adapter and a running gateway loop (the hosted-gateway lane);
     a non-push adapter (stateless API server) would need the raw gateway session id, which cron
-    jobs never carry, so that lane is out of scope here. Returns False on anything short of a
-    confirmed wake (no adapter/loop, empty text, non-push adapter, ``WakeNotAccepted``, or any
-    other exception) so the caller degrades to the existing passive mirror — this can only ever be
+    jobs never carry, so that lane is out of scope here — the router itself degrades to "not
+    woken" in that case. Returns False on anything short of a confirmed wake (empty text, no
+    adapter/loop, non-push adapter, ``WakeNotAccepted``, any other exception, OR a ROUTINE
+    classification) so the caller degrades to the existing passive mirror — this can only ever be
     additive, never a new way to lose a cron delivery.
     """
     text = (wake_text or "").strip()
-    if not text or adapter is None or loop is None or not getattr(loop, "is_running", lambda: False)():
+    if not text:
         return False
-    from gateway.wake import WAKE_TURN_TIMEOUT_SECONDS, WakeNotAccepted, adapter_supports_push, deliver_wake
-    if not adapter_supports_push(adapter):
-        return False
-    from agent.async_utils import safe_schedule_threadsafe
-    from gateway.config import Platform
-    from gateway.session import SessionSource
-    try:
-        platform_enum = Platform(platform_name.lower())
-    except (ValueError, KeyError):
-        return False
-    source = SessionSource(
-        platform=platform_enum, chat_id=str(chat_id), thread_id=thread_id, user_id=user_id)
-    try:
-        coro = deliver_wake(adapter, text=_cron_mirror_message(job, text), source=source)
-        future = safe_schedule_threadsafe(coro, loop)
-        if future is None:
-            return False
-        future.result(timeout=WAKE_TURN_TIMEOUT_SECONDS)
-    except WakeNotAccepted as e:
-        logger.warning(
-            "Job '%s': wake not accepted for %s:%s (%s) — falling back to transcript mirror",
-            job.get("id", "?"), platform_name, chat_id, e)
-        return False
-    except Exception as e:
-        logger.warning(
-            "Job '%s': wake_on_alert delivery failed for %s:%s: %s — falling back to transcript "
-            "mirror", job.get("id", "?"), platform_name, chat_id, e)
-        return False
-    logger.info(
-        "Job '%s': woke %s:%s with a real agent turn (wake_on_alert)",
-        job.get("id", "?"), platform_name, chat_id)
-    return True
+    from gateway.event_router import Event, route_event
+    event = Event(
+        kind="cron_alert", source=f"cron:{job.get('id', '?')}",
+        title=job.get("name") or job.get("id", "cron"), body=text,
+        metadata={"job_id": job.get("id")},
+    )
+    result = route_event(
+        event, adapter=adapter, loop=loop, platform_name=platform_name, chat_id=chat_id,
+        thread_id=thread_id, user_id=user_id)
+    if result.woke:
+        logger.info(
+            "Job '%s': woke %s:%s with a real agent turn (wake_on_alert, severity=%s)",
+            job.get("id", "?"), platform_name, chat_id, result.severity)
+    else:
+        logger.debug(
+            "Job '%s': not woken for %s:%s (severity=%s, meta=%s) — falling back to transcript "
+            "mirror", job.get("id", "?"), platform_name, chat_id, result.severity, result.severity_meta)
+    return result.woke
 
 
 def _seed_live_delivery_sessions(t: _TargetDelivery, delivered_message_id) -> None:
@@ -1454,14 +1471,20 @@ def _seed_live_delivery_sessions(t: _TargetDelivery, delivered_message_id) -> No
     # consent — the estate's alert-worthy cron jobs deliberately address the owner's DM/group via
     # an EXPLICIT `platform:chat_id` (shared/claude-plugins#894 routing ruling), which is never
     # mirror-eligible without ALSO setting attach_to_session. Requiring both would silently disable
-    # wake for exactly the jobs it exists for. So wake checks only its own flag; when a wake also
-    # lands on a mirror-eligible target, the passive mirror below is redundant and skipped. A
-    # failed/unavailable wake (no push adapter, no running loop, WakeNotAccepted, any other error)
-    # falls through to the mirror unchanged (when the target is mirror-eligible) — this can only
-    # add a delivery path, never remove the existing one.
-    woke = _cron_wake_requested(job) and _maybe_wake_cron_target(
-        job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.thread_id,
-        user_id=t.origin_user_id, adapter=t.runtime_adapter, loop=t.loop)
+    # wake for exactly the jobs it exists for. So wake does NOT reuse mirror_this_target — but it
+    # DOES still gate on _wake_target_eligible: a job's opt-in authorizes waking ITS intended
+    # recipient(s), never an untagged `all`-broadcast expansion member (round-1 review finding on
+    # ahmednfwela/hermes-agent#3 — `deliver: all` + `wake_on_alert: true` must not wake every
+    # configured platform's home channel for one alert). When a wake also lands on a mirror-eligible
+    # target, the passive mirror below is redundant and skipped. A failed/unavailable/ineligible
+    # wake falls through to the mirror unchanged (when the target is mirror-eligible) — this can
+    # only add a delivery path, never remove the existing one.
+    woke = (
+        _cron_wake_requested(job)
+        and _wake_target_eligible(t.resolved_from, t.origin_target)
+        and _maybe_wake_cron_target(
+            job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.thread_id,
+            user_id=t.origin_user_id, adapter=t.runtime_adapter, loop=t.loop))
     _maybe_mirror_cron_delivery(
         job, t.platform_name, t.chat_id, t.mirror_text, thread_id=t.thread_id,
         user_id=t.origin_user_id,
@@ -1726,7 +1749,8 @@ def _prepare_target_delivery(
         origin=origin, origin_target=origin_target, origin_user_id=origin_user_id,
         is_dm_target=is_dm_target, mirror_text=mirror_text, mirror_this_target=mirror_this_target,
         in_channel_surface=in_channel_surface, inchannel_continuable=inchannel_continuable,
-        opened_thread_id=opened_thread_id, live_adapter_ready=live_adapter_ready)
+        opened_thread_id=opened_thread_id, live_adapter_ready=live_adapter_ready,
+        resolved_from=target.get("_resolved_from"))
 
 
 def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
