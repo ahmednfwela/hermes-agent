@@ -92,6 +92,29 @@ class TestPollOnce:
         poll_once([row], tracker, route_event_fn=lambda ev, **kw: routed.append(ev))
         assert len(routed) == 1
 
+    def test_fail_resume_refail_re_alarms_through_poll_once(self):
+        """Independent review finding (PR #4 round 1, real bug not just a test gap):
+        `SeenLaneTracker` alone dedupes correctly on (lane_key, last status), but `poll_once`
+        used to skip calling `tracker.is_new()` at all for a healthy row (it filtered on
+        `classify_lane_kind` FIRST), so the tracker's last-seen state for a lane never advanced
+        past "failed" across a resume — a second real failure then read as "already seen" and was
+        silently dropped. Drive the full failed -> running -> failed sequence through `poll_once`
+        itself (not the tracker in isolation) and require TWO routed events."""
+        routed = []
+        tracker = SeenLaneTracker()
+
+        def _route(ev, **kw):
+            routed.append(ev)
+            return "ROUTED"
+
+        poll_once([LaneRow(lane_key="k1", status="failed", fail_reason="oops")], tracker, route_event_fn=_route)
+        poll_once([LaneRow(lane_key="k1", status="running")], tracker, route_event_fn=_route)
+        poll_once([LaneRow(lane_key="k1", status="failed", fail_reason="oops again")], tracker, route_event_fn=_route)
+
+        assert len(routed) == 2, (
+            "a lane that fails, resumes, then fails again must re-alarm on the SECOND failure "
+            f"through poll_once itself; got {len(routed)} routed event(s)")
+
     def test_passes_adapter_and_loop_through_to_route_event(self):
         captured = {}
 

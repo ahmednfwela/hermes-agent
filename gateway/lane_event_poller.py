@@ -87,14 +87,22 @@ def poll_once(
 ) -> list[Any]:
     """Route one ``Event`` per newly-observed failed/stalled row. Healthy rows and already-seen
     (lane_key, status) pairs are skipped. ``route_event_fn`` defaults to the real
-    ``gateway.event_router.route_event`` — injectable purely for tests."""
+    ``gateway.event_router.route_event`` — injectable purely for tests.
+
+    ``tracker.is_new(row)`` is called for EVERY row, healthy included — never only for rows that
+    already passed the ``classify_lane_kind`` filter. Filtering first was a real bug (independent
+    review, PR #4 round 1): the tracker's last-seen status for a lane_key would then never advance
+    past a stale "failed" across a resume (`running` sightings never reached the tracker), so a
+    lane that fails, resumes, and fails again silently failed to re-alarm on the second failure —
+    it read as "already seen" against the FIRST failure's still-current tracker entry. Observing
+    every row keeps the tracker's state honest; routing decides separately whether THIS observed
+    change is alert-worthy at all."""
     if route_event_fn is None:
         from gateway.event_router import route_event as route_event_fn  # noqa: PLC0414
     results = []
     for row in rows:
-        if classify_lane_kind(row.status) is None:
-            continue
-        if not tracker.is_new(row):
+        is_new = tracker.is_new(row)
+        if not is_new or classify_lane_kind(row.status) is None:
             continue
         event = build_lane_event(row)
         results.append(route_event_fn(
