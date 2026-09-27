@@ -49,6 +49,91 @@ def _checkpoint_path() -> Path:
     checkpoint to the launch home."""
     return CHECKPOINT_PATH if CHECKPOINT_PATH != _CHECKPOINT_PATH_AT_IMPORT else get_hermes_home() / "processes.json"
 
+
+# --- Windows Job Object: kill-on-close, assigned at spawn time ---------------
+# ``taskkill /PID <pid> /T /F`` (``_terminate_host_pid``'s Windows branch) walks Windows'
+# own ParentProcessId table to find descendants to kill. MSYS/Cygwin's background-job
+# (``&``) semantics reparent the child to a Cygwin-internal process the moment it's
+# spawned — its ParentProcessId never points back into the invoking bash's chain, so
+# taskkill /T returns SUCCESS on the recorded pid while the descendant keeps running.
+# This let OmniRoute's `npm run dev` (bash -> npm-cli -> cmd -> node -> esbuild) survive
+# `agent_close` on live Hermes (shared/claude-plugins#1042).
+#
+# A Windows Job Object sidesteps this: job membership propagates through process
+# creation / handle inheritance, independent of the ParentProcessId link — confirmed by
+# a deterministic live probe (assign the outer bash to a JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+# job while CREATE_SUSPENDED, resume, then background a child via `&`: the child IS a
+# member of that job despite its ParentProcessId pointing elsewhere, and CloseHandle(job)
+# kills it). See shared/claude-plugins#1052.
+#
+# CREATE_SUSPENDED before assignment matters: a process can only inherit job membership
+# for descendants it spawns AFTER being assigned to the job, so assigning after Popen()
+# already let the process run would race against it backgrounding a child too early.
+if _IS_WINDOWS:
+    import ctypes as _ctypes
+    from ctypes import wintypes as _wintypes
+
+    _CREATE_SUSPENDED = 0x00000004
+    _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+    _JOB_OBJECT_EXTENDED_LIMIT_INFO_CLASS = 9  # JobObjectExtendedLimitInformation info-class id
+
+    class _IoCounters(_ctypes.Structure):
+        _fields_ = [(n, _ctypes.c_ulonglong) for n in (
+            "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+            "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+    class _JobObjectBasicLimitInformation(_ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", _wintypes.LARGE_INTEGER), ("PerJobUserTimeLimit", _wintypes.LARGE_INTEGER),
+            ("LimitFlags", _wintypes.DWORD), ("MinimumWorkingSetSize", _ctypes.c_size_t),
+            ("MaximumWorkingSetSize", _ctypes.c_size_t), ("ActiveProcessLimit", _wintypes.DWORD),
+            ("Affinity", _ctypes.POINTER(_wintypes.ULONG)), ("PriorityClass", _wintypes.DWORD),
+            ("SchedulingClass", _wintypes.DWORD),
+        ]
+
+    class _JobObjectExtendedLimitInformation(_ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _JobObjectBasicLimitInformation),
+            ("IoInfo", _IoCounters),
+            *((n, _ctypes.c_size_t) for n in (
+                "ProcessMemoryLimit", "JobMemoryLimit", "PeakProcessMemoryUsed", "PeakJobMemoryUsed")),
+        ]
+
+    def _win_create_kill_on_close_job() -> Optional[int]:
+        """A fresh job object with JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, or None on any
+        failure — callers must treat None as "no job available" and fall back to the
+        legacy taskkill /T path rather than raising; job-object hardening is additive,
+        never a precondition for a background command to run."""
+        try:
+            kernel32 = _ctypes.windll.kernel32
+            job = kernel32.CreateJobObjectW(None, None)
+            if not job:
+                return None
+            info = _JobObjectExtendedLimitInformation()
+            info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            ok = kernel32.SetInformationJobObject(
+                job, _JOB_OBJECT_EXTENDED_LIMIT_INFO_CLASS, _ctypes.byref(info), _ctypes.sizeof(info))
+            if not ok:
+                kernel32.CloseHandle(job)
+                return None
+            return job
+        except Exception:
+            logger.debug("Windows job object creation failed", exc_info=True)
+            return None
+
+    def _win_assign_to_job(job: int, process_handle: int) -> bool:
+        try:
+            return bool(_ctypes.windll.kernel32.AssignProcessToJobObject(job, process_handle))
+        except Exception:
+            logger.debug("Windows job object assignment failed", exc_info=True)
+            return False
+
+    def _win_close_job(job: int) -> None:
+        """Closing the handle fires JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, terminating every
+        member — the primary Windows kill mechanism (see ``_terminate_host_pid``)."""
+        with suppress(Exception):
+            _ctypes.windll.kernel32.CloseHandle(job)
+
 MAX_OUTPUT_CHARS = 200_000      # rolling output buffer
 FINISHED_TTL_SECONDS = 1800     # keep finished processes 30 minutes
 MAX_PROCESSES = 64              # max tracked processes (LRU pruning)
@@ -442,6 +527,11 @@ class ProcessSession:
     detached: bool = False                      # Recovered from checkpoint (no pipe)
     pid_scope: str = "host"                     # "host" for local/PTY PIDs, "sandbox" for env-local PIDs
     systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run
+    win_job_handle: Optional[int] = field(default=None, repr=False)
+                                                 # Windows Job Object HANDLE assigned at spawn time (int, this
+                                                 # process only — never persisted/recovered across a restart).
+                                                 # kill-on-close catches MSYS/Cygwin background (`&`) descendants
+                                                 # that escape taskkill /T's ParentProcessId walk (#1042/#1052).
     handoff_note: str = ""                      # why a subagent handed this process to its parent (rides the notice)
     # Watcher/notification routing (persisted for crash recovery)
     # systemd_unit: str = ""                      # transient scope unit name when spawned under systemd-run
@@ -792,15 +882,22 @@ class ProcessRegistry(ProcessCheckpointMixin):
         return ProcessRegistry._config_seconds("daemon_term_grace_seconds", 2.0)
 
     @classmethod
-    def _terminate_host_pid(cls, pid: int, expected_start: Optional[int] = None) -> None:
+    def _terminate_host_pid(
+        cls, pid: int, expected_start: Optional[int] = None, win_job_handle: Optional[int] = None,
+    ) -> None:
         """Terminate a host-visible PID and its descendants.
         ``expected_start`` (kernel start time at spawn) is re-validated first: a mismatch
         or dead PID means the number was recycled onto a stranger and we refuse to touch
         it — a leaked orphan beats tree-killing someone's browser. POSIX: psutil SIGTERMs
         children before the parent (so trees aren't reparented to init and survive), then
-        SIGKILLs survivors after ``terminal.daemon_term_grace_seconds``. Windows:
-        ``taskkill /T /F`` (psutil's stale PPID links miss orphans there); ``os.kill``
-        is the fallback."""
+        SIGKILLs survivors after ``terminal.daemon_term_grace_seconds``. Windows: closing
+        ``win_job_handle`` (a kill-on-close job assigned at spawn time, #1042/#1052) is the
+        PRIMARY mechanism when present — job membership propagates through process
+        creation/handle inheritance regardless of the ParentProcessId link, so it reaches
+        MSYS/Cygwin background (``&``) descendants that never appear as ``pid``'s children
+        in Windows' own process table. ``taskkill /T /F`` always runs too, as a fallback for
+        sessions with no job handle (recovered/adopted pids predating this fix) and as
+        belt-and-suspenders otherwise; ``os.kill`` is the last-resort fallback for either."""
         if expected_start is not None and not cls._host_pid_is_ours(pid, expected_start):
             logger.warning(
                 "Refusing to terminate host pid %d: start-time mismatch — "
@@ -811,6 +908,8 @@ class ProcessRegistry(ProcessCheckpointMixin):
             with suppress(OSError, ProcessLookupError, PermissionError):
                 os.kill(pid, signal.SIGTERM)
         if _IS_WINDOWS:
+            if win_job_handle is not None:
+                _win_close_job(win_job_handle)
             try:
                 subprocess.run(
                     ["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True, text=True,
@@ -976,7 +1075,12 @@ class ProcessRegistry(ProcessCheckpointMixin):
                         ) from e
                     session.systemd_unit = ""
         # Pipe path (non-PTY or PTY fallback).
-        _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
+        # On Windows the child is spawned CREATE_SUSPENDED so it can be assigned to a
+        # kill-on-close job object (#1042/#1052) before it has a chance to background any
+        # descendant of its own; _assign_win_job_and_resume() resumes it unconditionally
+        # right after, whether or not the job assignment itself succeeded.
+        _win_creationflags = windows_hide_flags() | _CREATE_SUSPENDED if _IS_WINDOWS else 0
+        _popen_kwargs = {"creationflags": _win_creationflags} if _IS_WINDOWS else {}
         unit_suffix = f"{session.id}-pipe-fallback" if pty_scope_attempted else session.id
         spawn_argv = self._scope_argv(session, safe_command, unit_suffix, "Local")
         spawn_env = self._spawn_env(env_vars)
@@ -994,12 +1098,35 @@ class ProcessRegistry(ProcessCheckpointMixin):
         session.process = proc
         session.pid = proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
+        if _IS_WINDOWS:
+            self._assign_win_job_and_resume(session, proc)
         try:
             self._track_started(session, self._reader_loop, f"proc-reader-{session.id}")
         except Exception:
             self._reap_untracked(session, proc)
             raise
         return session
+
+    @staticmethod
+    def _assign_win_job_and_resume(session: "ProcessSession", proc: subprocess.Popen) -> None:
+        """Windows only: assign *proc* (spawned CREATE_SUSPENDED) to a fresh kill-on-close
+        job object, then resume it regardless of whether the assignment succeeded — job-object
+        hardening is additive; a background command the caller asked to run must still run
+        even when it's unavailable, falling back to plain taskkill /T (see ``_terminate_host_pid``)."""
+        job = _win_create_kill_on_close_job()
+        if job is not None:
+            if _win_assign_to_job(job, int(proc._handle)):
+                session.win_job_handle = job
+            else:
+                _win_close_job(job)
+        try:
+            import psutil
+
+            psutil.Process(proc.pid).resume()
+        except Exception:
+            logger.error(
+                "Failed to resume CREATE_SUSPENDED pid=%d after Windows job-object setup; "
+                "it may never produce output.", proc.pid, exc_info=True)
 
     def _reap_untracked(self, session: ProcessSession, proc: subprocess.Popen) -> None:
         """Post-Popen setup failed: kill the orphaned subprocess (and any setsid
@@ -1012,7 +1139,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
                 # The worker runs in its own systemd scope and, since the #70716 session-isolation fix, its
                 # own session. Stop the scope (kills every process in the worker cgroup), then terminate the
                 # systemd-run wrapper PID as fallback.
-                self._terminate_host_pid(proc.pid, session.host_start_time)
+                self._terminate_host_pid(proc.pid, session.host_start_time, session.win_job_handle)
             elif not _IS_WINDOWS:
                 try:
                     kill_signal = getattr(signal, "SIGKILL", signal.SIGTERM)
@@ -1841,7 +1968,7 @@ class ProcessRegistry(ProcessCheckpointMixin):
         elif session.process:
             # Tree kill: on Windows Popen.terminate() only kills the shell wrapper and
             # leaves Git Bash descendants behind.
-            self._terminate_host_pid(session.process.pid, session.host_start_time)
+            self._terminate_host_pid(session.process.pid, session.host_start_time, session.win_job_handle)
         elif session.env_ref and session.pid:
             session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
         elif session.detached and session.pid_scope == "host" and session.pid:
@@ -1862,7 +1989,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     self._completion_consumed.add(session_id)
                 self._move_to_finished(session)
                 return {"status": "already_exited", "exit_code": session.exit_code, "output": output}
-            self._terminate_host_pid(session.pid, session.host_start_time)
+            # A recovered/detached session's win_job_handle is always None (a job HANDLE
+            # is only valid within the process that created it and is never persisted to
+            # the crash-recovery checkpoint) -- falls back to taskkill /T, same as before.
+            self._terminate_host_pid(session.pid, session.host_start_time, session.win_job_handle)
         else:
             return {
                 # Reject non-positive timeouts — the schema declares minimum=1, but not every caller
