@@ -121,17 +121,29 @@ class TestClassifySeverityFailOpen:
         monkeypatch.setattr(
             er, "_jev_classify", lambda instruction, body, **k: {"ok": False, "error": "shim_unavailable", "failOpen": True})
         severity, meta = classify_severity(_event(title="ALARM: build is broken", body="ci is red"))
-        assert severity == "ALARM"  # deterministic keyword match ("ALARM")
+        assert severity == "ALARM"
         assert meta["source"] == "deterministic_fallback"
         assert fail_open_count() == 1
 
-    def test_jev_failure_deterministic_routine_when_no_keyword_matches(self, monkeypatch):
+    def test_jev_failure_fails_open_to_alarm_even_without_an_alarm_keyword(self, monkeypatch):
+        """Round-2 review finding (PR#3): the original fallback gated ALARM on an 11-word keyword
+        allowlist and defaulted to ROUTINE otherwise — the OPPOSITE of this module's own stated
+        design ("a deliberately conservative keyword denylist... errs toward ALARM (a missed alarm
+        is worse than one extra wake)"). Measured live: `hermes_cluster` isn't importable even on
+        the deployed gateway pod today (kubectl exec, 2026-09-27), so EVERY `wake_on_alert`
+        delivery in production currently runs this fallback — and real alert text routinely has no
+        exact keyword match (e.g. lane-health-patrol's own "STALE-CHECKPOINT: ... running 60+min,
+        last owner-note stale/none" alarm line matches none of `_ALARM_KEYWORDS`), so the keyword
+        gate would have silently un-done round 1's unconditional-wake-for-eligible-targets
+        guarantee. Fail-open must be unconditional ALARM, full stop, regardless of content."""
         import gateway.event_router as er
 
         monkeypatch.setattr(
             er, "_jev_classify", lambda instruction, body, **k: {"ok": False, "error": "shim_unavailable", "failOpen": True})
-        severity, meta = classify_severity(_event(kind="cron_alert", title="digest", body="everything is fine"))
-        assert severity == "ROUTINE"
+        severity, meta = classify_severity(_event(
+            kind="cron_alert", title="STALE-CHECKPOINT",
+            body="invora/invora-backend#412 running 60+min, last owner-note stale/none"))
+        assert severity == "ALARM", "no keyword in this real alarm line -- fail-open must still wake"
         assert meta["source"] == "deterministic_fallback"
         assert fail_open_count() == 1
 
@@ -144,7 +156,7 @@ class TestClassifySeverityFailOpen:
             raise ImportError("no module named hermes_cluster")
 
         monkeypatch.setattr(er, "_jev_classify", _raise)
-        severity, meta = classify_severity(_event(title="ALARM: x", body="y"))
+        severity, meta = classify_severity(_event(title="a routine-sounding digest", body="y"))
         assert severity == "ALARM"
         assert meta["source"] == "deterministic_fallback"
         assert fail_open_count() == 1

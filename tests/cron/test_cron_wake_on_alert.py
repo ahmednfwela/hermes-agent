@@ -155,9 +155,22 @@ class TestMaybeWakeCronTarget:
         event = adapter.handled[0]
         assert "ALARM: build is broken" in event.text
 
-    def test_routine_content_does_not_wake(self, running_loop):
+    def test_routine_content_does_not_wake(self, running_loop, monkeypatch):
         """The whole point of routing through the router: wake_on_alert=true no longer means
-        UNCONDITIONAL wake — a routine-sounding delivery from an alert-capable job stays quiet."""
+        UNCONDITIONAL wake — a routine-sounding delivery from an alert-capable job stays quiet
+        WHEN THE CLASSIFIER ITSELF SAYS SO.
+
+        Explicitly mocks a genuine jev ROUTINE verdict rather than relying on incidental
+        fail-open text-matching (round-2 review finding, PR#3: this test previously ran with NO
+        mock at all and passed only because `hermes_cluster` isn't vendored into this repo, so
+        `_jev_classify` always fails here — it was measuring the FAIL-OPEN default for this one
+        text, not a real ROUTINE classification, and would have silently started asserting the
+        opposite the moment fail-open was corrected to always-ALARM below)."""
+        import gateway.event_router as er
+
+        monkeypatch.setattr(
+            er, "_jev_classify",
+            lambda instruction, body, **k: {"ok": True, "choice": "ROUTINE", "probabilities": {"ROUTINE": 0.9}})
         adapter = PushAdapter()
         job = {"id": "j7", "name": "factory-progress-digest"}
         ok = _maybe_wake_cron_target(

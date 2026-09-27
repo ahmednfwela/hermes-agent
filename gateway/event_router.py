@@ -10,12 +10,19 @@ it). Producers (cron delivery, a cluster-lane poller, ...) call `route_event`; t
 severity themselves and never call `deliver_wake` directly.
 
 Severity decision, owner ruling ("use jev for classification work"): jev
-(`hermes_cluster.core.jev_client.classify`) is the PRIMARY classifier. A deterministic keyword
-rule is used ONLY when jev fails for any reason (shim missing, node missing, timeout, or the
-package simply isn't vendored into this pod — an ImportError is just another fail-open cause, not
-a hard dependency this module imposes). Every fail-open is counted AND logged at WARNING — per the
-ruling, "fail-open paths must be reported, not silent." `fail_open_count()` is read by the digest /
-the continuous regression oracle (shared/claude-plugins#1050) to surface classifier-health.
+(`hermes_cluster.core.jev_client.classify`) is the PRIMARY classifier. On ANY jev failure (shim
+missing, node missing, timeout, or the package simply isn't vendored into this pod — an
+ImportError is just another fail-open cause, not a hard dependency this module imposes), the
+fallback is UNCONDITIONAL ALARM (`_deterministic_fallback`) — never content-based. A missed alarm
+is worse than one extra wake, and (round-2 review finding, PR#3) a content/keyword-gated fallback
+was found to silently under-wake real alert text that doesn't happen to contain one of a small
+keyword set — exactly the "never wakes up" bug this router exists to fix, reintroduced by the
+fallback path itself. `hermes_cluster` is measured NOT importable even on the deployed gateway pod
+as of 2026-09-27, so this fallback is not a rare edge case — it is currently the path every
+`wake_on_alert` delivery takes in production. Every fail-open is counted AND logged at WARNING —
+per the ruling, "fail-open paths must be reported, not silent." `fail_open_count()` is read by the
+digest / the continuous regression oracle (shared/claude-plugins#1050) to surface classifier-health
+so this interim state stays visible, not silently permanent.
 
 `kind`s in `_ALWAYS_SERIOUS_KINDS` skip jev entirely (never spend a classification call on a
 signal that is unambiguous by construction, e.g. a node going offline) and route straight to ALARM.
@@ -47,13 +54,6 @@ _JEV_INSTRUCTION = (
 # Kinds that are unambiguous by construction — spending a jev call on them would only add latency
 # and cost for a decision that is never in doubt.
 _ALWAYS_SERIOUS_KINDS = frozenset({"node_offline", "lane_failed"})
-
-# Fail-open fallback: a small, deliberately conservative keyword denylist. Errs toward ALARM (a
-# missed alarm is worse than one extra wake) — case-insensitive, matched against title+body.
-_ALARM_KEYWORDS = (
-    "alarm", "critical", "error", "failed", "failure", "429", "offline", "drift", "down",
-    "blocked", "crash", "timeout", "denied",
-)
 
 _fail_open_lock = threading.Lock()
 _fail_open_total = 0
@@ -119,8 +119,23 @@ def _jev_classify(instruction: str, body: str, **kwargs) -> dict:
 
 
 def _deterministic_fallback(event: Event) -> str:
-    haystack = f"{event.title}\n{event.body}".lower()
-    return "ALARM" if any(kw in haystack for kw in _ALARM_KEYWORDS) else "ROUTINE"
+    """Fail-open verdict when jev is unavailable. UNCONDITIONALLY "ALARM" — no content matching of
+    any kind.
+
+    Round-2 review finding (PR#3, ahmednfwela/hermes-agent): the first version of this function
+    gated ALARM on an 11-word keyword allowlist and defaulted to ROUTINE for everything else — the
+    OPPOSITE of the "errs toward ALARM (a missed alarm is worse than one extra wake)" contract this
+    module's docstring already promised. Measured live (kubectl exec into the deployed gateway pod,
+    2026-09-27): `hermes_cluster` is not importable there either, so this fallback is not a rare
+    edge case — it is, right now, the path EVERY `wake_on_alert` delivery in production takes. Real
+    alert text routinely carries no exact keyword match (e.g. lane-health-patrol's own
+    "STALE-CHECKPOINT: ... running 60+min, last owner-note stale/none" line matches none of the old
+    list), so the keyword gate silently re-broke the exact bug `wake_on_alert` exists to fix (the
+    owner's report: "they aren't giving my chat session a turn"). `event` is intentionally unused —
+    kept as a parameter so a future REAL fallback heuristic (if one is ever justified) has the same
+    call shape as `classify_severity` already expects, without another signature change."""
+    del event
+    return "ALARM"
 
 
 def classify_severity(event: Event) -> tuple[str, dict]:
