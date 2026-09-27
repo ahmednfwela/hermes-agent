@@ -1253,9 +1253,14 @@ class TurnRunner:
         session_key = ctx.session_key or ""
         clarify_id = uuid.uuid4().hex[:10]
         choices = list(choices) if choices else None
+        # Routing hints for the durable ledger only (shared/claude-plugins #1037/#1040 class C6
+        # follow-up) — never required for the live in-memory resolve path below.
+        _platform_val = getattr(getattr(ctx._status_adapter, "platform", None), "value", None)
         clarify_mod.register(
             clarify_id=clarify_id, session_key=session_key, question=question, choices=choices,
             multi_select=bool(multi_select),
+            platform=_platform_val, chat_id=ctx._status_chat_id,
+            thread_id=(ctx._status_thread_metadata or {}).get("thread_id"),
         )
         # Unlike approval, clarify passes reopen=True so the continuation re-opens a native stream
         # below the question; if the re-seed fails the consumer degrades to send() automatically.

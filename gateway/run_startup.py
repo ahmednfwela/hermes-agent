@@ -214,6 +214,7 @@ class GatewayStartupMixin:
         """
         from gateway.run import _clear_planned_restart_notification, _startup_restore_drain_timeout_secs
         claimed = await self._claim_pending_obligations()
+        orphaned_clarifies = await self._claim_orphaned_clarifies()
 
         async def _boot_sends() -> None:
             await self._send_restart_notification()
@@ -223,6 +224,7 @@ class GatewayStartupMixin:
                 finally:
                     _clear_planned_restart_notification()
             await self._redeliver_claimed_obligations(claimed)
+            await self._notify_orphaned_clarifies(orphaned_clarifies)
 
         boot_task = asyncio.create_task(_boot_sends())
         timeout = _startup_restore_drain_timeout_secs()
@@ -433,6 +435,70 @@ class GatewayStartupMixin:
                 error=row.get("last_error") or "send_path_degraded",
             )
         return adapter
+
+    async def _claim_orphaned_clarifies(self) -> list:
+        """Claim durable pending-clarify rows left behind by a process that died before the owner
+        answered (shared/claude-plugins #1037/#1040 class C6 follow-up — see
+        ``gateway/clarify_ledger.py``'s own docstring for the full root-cause note). Pure DB work,
+        no sends; mirrors ``_claim_pending_obligations``'s split of claim (here) from notify
+        (``_notify_orphaned_clarifies``, run inside the same bounded boot-send task)."""
+        try:
+            from gateway.clarify_ledger import sweep_orphaned
+            return await asyncio.to_thread(sweep_orphaned)
+        except Exception:
+            logger.debug("clarify ledger sweep failed", exc_info=True)
+            return []
+
+    async def _notify_orphaned_clarifies(self, claimed: list) -> int:
+        """Tell each chat with an orphaned clarify what happened: one explicit notice naming the
+        interrupted question, so a restart-during-clarify is a visible, understood event instead
+        of the owner's next message silently falling through as an unrelated new turn. Best-effort
+        per row — a failed notice is logged and skipped, never retried (unlike delivery
+        obligations, there is no redelivery budget here: the row is already gone from the ledger
+        by the time this runs, and the ONLY consequence of a missed notice is the owner not
+        learning why their earlier answer wasn't seen, not a lost reply)."""
+        notified = 0
+        for row in claimed:
+            platform_raw = row.get("platform")
+            chat_id = row.get("chat_id")
+            if not platform_raw or not chat_id:
+                logger.info(
+                    "Orphaned clarify %s has no routing info — cannot notify (question: %r)",
+                    row.get("clarify_id"), (row.get("question") or "")[:120])
+                continue
+            try:
+                platform = Platform(str(platform_raw))
+            except Exception:
+                logger.debug("Orphaned clarify %s: unknown platform %r", row.get("clarify_id"), platform_raw)
+                continue
+            adapter = self._authorization_adapter(platform, row.get("adapter_profile"))
+            if adapter is None:
+                adapter = self.adapters.get(platform)
+            if adapter is None:
+                logger.info(
+                    "Orphaned clarify %s: no connected adapter for %s — cannot notify",
+                    row.get("clarify_id"), platform.value)
+                continue
+            question = (row.get("question") or "").strip()
+            content = (
+                "⚠️ I restarted while waiting for your answer to:\n\n"
+                f"❓ {question}\n\n"
+                "That prompt didn't survive the restart — please resend your answer or just ask again."
+            )
+            metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
+            try:
+                result = await adapter.send(chat_id=chat_id, content=content, metadata=metadata)
+            except Exception as exc:
+                logger.warning("Orphaned clarify %s: notice send raised: %s", row.get("clarify_id"), exc)
+                continue
+            if result is not None and getattr(result, "success", False):
+                notified += 1
+                logger.info("Notified %s:%s of orphaned clarify %s", platform.value, chat_id, row.get("clarify_id"))
+            else:
+                logger.warning(
+                    "Orphaned clarify %s: notice send failed (%s)",
+                    row.get("clarify_id"), getattr(result, "error", "") if result is not None else "no result")
+        return notified
 
     async def _redeliver_pending_obligations(self) -> int:
         """Claim + redeliver in one call. Stable shape for tests/external callers; the startup path
