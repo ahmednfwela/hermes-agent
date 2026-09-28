@@ -44,14 +44,32 @@ TEXT_NO_PENDING = "no_pending"
 
 
 def register(clarify_id: str, session_key: str, question: str, choices: Optional[List[str]],
-             multi_select: bool = False) -> _ClarifyEntry:
+             multi_select: bool = False, *, platform: Optional[str] = None,
+             chat_id: Optional[str] = None, thread_id: Optional[str] = None,
+             adapter_profile: Optional[str] = None) -> _ClarifyEntry:
     """Register a pending clarify request; caller then blocks on ``wait_for_response``.
-    Open-ended (no choices) entries start in text mode: the next message IS the response."""
+    Open-ended (no choices) entries start in text mode: the next message IS the response.
+
+    ``platform``/``chat_id``/``thread_id``/``adapter_profile`` are OPTIONAL routing hints (a
+    caller with no chat to route to, e.g. an internal/synthetic session, passes none of them) used
+    ONLY to durably record this entry (``gateway.clarify_ledger``) so a gateway restart while this
+    prompt is open can be recognized and surfaced on the next boot, instead of silently vanishing
+    with the in-memory entry below — shared/claude-plugins #1037/#1040 class C6 follow-up. Best
+    effort: a ledger failure must never block registering the LIVE (in-memory) entry, which is
+    what the current process actually resolves against."""
     entry = _ClarifyEntry(clarify_id, session_key, question, list(choices) if choices else None,
                           bool(multi_select) and bool(choices), awaiting_text=not bool(choices))
     with _lock:
         _entries[clarify_id] = entry
         _session_index.setdefault(session_key, []).append(clarify_id)
+    try:
+        from gateway.clarify_ledger import record_pending
+        record_pending(clarify_id, session_key, question=question, choices=choices,
+                       multi_select=multi_select, platform=platform, chat_id=chat_id,
+                       thread_id=thread_id, adapter_profile=adapter_profile)
+    except Exception:
+        logger.debug("clarify_ledger.record_pending failed for %s — durability skipped, "
+                     "in-memory entry unaffected", clarify_id, exc_info=True)
     return entry
 
 
@@ -84,6 +102,11 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
             ids.remove(clarify_id)
             if not ids:
                 _session_index.pop(entry.session_key, None)
+    try:
+        from gateway.clarify_ledger import mark_done
+        mark_done(clarify_id)
+    except Exception:
+        logger.debug("clarify_ledger.mark_done failed for %s (best-effort)", clarify_id, exc_info=True)
     return entry.response
 
 
