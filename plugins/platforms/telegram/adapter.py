@@ -505,6 +505,18 @@ class TelegramAdapter(BasePlatformAdapter):
         self._status_indicator_enabled: bool = bool(extra.get("status_indicator", False))
         self._status_online_text: str = str(extra.get("status_online", "Online"))
         self._status_offline_text: str = str(extra.get("status_offline", "Offline"))
+        # Cold-boot queue preservation (shared/claude-plugins lane-chat, #1037/#1040 class C6
+        # follow-up): upstream's own contract is "cold first boot (dropping is reasonable)"
+        # (NousResearch/hermes-agent#46621, which fixed ONLY the watcher-reconnect leg and
+        # explicitly left cold boot out of scope) — a defensible default for a fresh/dormant
+        # install, but WRONG for an always-on hosted deployment whose "cold boot" is a routine
+        # pod restart/redeploy indistinguishable, from the sender's perspective, from a network
+        # blip. Off by default (byte-identical to today for every other deployment); a
+        # long-lived single-tenant gateway opts in via extra.preserve_queue_on_cold_boot so a
+        # message sent during a crash/redeploy window is delivered on the next getUpdates
+        # instead of being permanently dropped by Telegram's own queue-eviction semantics.
+        self._preserve_queue_on_cold_boot: bool = self._coerce_bool_extra(
+            "preserve_queue_on_cold_boot", False)
         self._dm_topics_config: List[Dict[str, Any]] = extra.get("dm_topics", [])
         # chat_ids with DM topics configured (O(1) root-DM ignore check)
         self._dm_topic_chat_ids: Set[str] = {str(e["chat_id"]) for e in self._dm_topics_config if "chat_id" in e}
@@ -2911,7 +2923,9 @@ class TelegramAdapter(BasePlatformAdapter):
         await self._app.updater.start_webhook(
             listen=webhook_host, port=webhook_port, url_path=webhook_path, webhook_url=webhook_url,
             secret_token=webhook_secret, allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=not is_reconnect,  # push-based ⇒ practically a no-op; mirrors polling
+            # push-based ⇒ practically a no-op (Telegram isn't holding a getUpdates-style queue
+            # for us); mirrors the polling decision for consistency if that ever changes.
+            drop_pending_updates=self._should_drop_pending_updates(is_reconnect),
        )
         self._webhook_mode = True
         self._polling_progress_accepting = False
@@ -2919,6 +2933,17 @@ class TelegramAdapter(BasePlatformAdapter):
         logger.info(
             "[%s] Webhook server listening on %s:%d%s", self.name, webhook_host or "* (all interfaces, IPv4+IPv6)",
             webhook_port, webhook_path)
+
+    def _should_drop_pending_updates(self, is_reconnect: bool) -> bool:
+        """True => tell Telegram to evict whatever it queued while we were away.
+
+        A watcher reconnect (``is_reconnect=True``) always preserves the queue (unchanged).
+        A cold boot drops it UNLESS this deployment set
+        ``extra.preserve_queue_on_cold_boot`` — see the flag's own comment in ``__init__``
+        for why the upstream default is wrong for an always-on hosted gateway."""
+        if is_reconnect:
+            return False
+        return not self._preserve_queue_on_cold_boot
 
     async def _start_polling_mode(self, *, is_reconnect: bool) -> None:
         """Clear any stale webhook and start resilient long polling."""
@@ -2942,8 +2967,12 @@ class TelegramAdapter(BasePlatformAdapter):
 
         self._polling_error_callback_ref = _polling_error_callback  # reused by _handle_polling_conflict
         polling_started = await self._start_polling_resilient(
-            # Cold first boot drops the stale Bot API queue; a watcher reconnect preserves it.
-            drop_pending_updates=not is_reconnect, error_callback=_polling_error_callback, require_progress=not is_reconnect)
+            # Cold first boot drops the stale Bot API queue unless this deployment opted into
+            # preservation (extra.preserve_queue_on_cold_boot); a watcher reconnect always
+            # preserves it. require_progress stays tied to is_reconnect regardless — cold start
+            # still needs the strict readiness gate independent of the drop decision.
+            drop_pending_updates=self._should_drop_pending_updates(is_reconnect),
+            error_callback=_polling_error_callback, require_progress=not is_reconnect)
         if not polling_started:
             logger.warning(
                 "[%s] Connected in degraded Telegram mode: gateway is alive, polling will be retried in the background", self.name)
