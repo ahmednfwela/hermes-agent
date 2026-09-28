@@ -27,6 +27,31 @@ def client(tmp_path, monkeypatch):
     return test_client
 
 
+@pytest.fixture
+def generous_budget(monkeypatch):
+    """Real ``hardware.probe_budget()`` reads the ACTUAL host — GPU-less CI
+    runners and this dev box both probe small enough that
+    ``catalog.recommended_entry`` finds nothing zero-spill-fits and returns
+    None, which the route correctly reports as a 409 ("No automatic
+    recommendation for this machine"). That is real, desired preflight
+    behaviour (see test_quickstart_without_recommendation_requires_explicit_choice,
+    which exercises it on purpose) — it is just the wrong dependency for a
+    test whose only subject is the install/download/activate SEQUENCING,
+    which needs some entry to be picked and doesn't care which one. Mirrors
+    the explicit HardwareBudget already used for that other test, sized
+    generously enough that some catalog entry clears the pleasant-speed
+    floor zero-spill on any machine's real catalog.json."""
+    from hermes_cli.local_runtime.estimator import HardwareBudget
+    import hermes_cli.web_routers.local_models as lm
+
+    gib = 1 << 30
+    budget = HardwareBudget(
+        usable_vram_bytes=24 * gib, total_device_bytes=24 * gib,
+        ram_available_bytes=128 * gib, uma=False,
+    )
+    monkeypatch.setattr(lm.hardware, "probe_budget", lambda **kw: budget)
+
+
 def _wait_job(client, job_id: str, timeout: float = 10.0) -> dict:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -118,7 +143,7 @@ def test_quickstart_refuses_when_nothing_fits(client, monkeypatch):
     assert "Local Models" in r.json()["detail"]
 
 
-def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
+def test_quickstart_runs_all_three_legs(client, generous_budget, monkeypatch, tmp_path):
     """Fresh machine: install runtime -> download recommended -> activate.
     Each leg is asserted by its observable call, in order."""
     calls: list[str] = []
@@ -179,7 +204,7 @@ def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
     assert load_config()["local_runtime"]["enabled"] is True
 
 
-def test_quickstart_skips_satisfied_legs(client, monkeypatch):
+def test_quickstart_skips_satisfied_legs(client, generous_budget, monkeypatch):
     """Runtime present and model already staged: the response says so and
     the job goes straight to activation."""
     calls: list[str] = []
