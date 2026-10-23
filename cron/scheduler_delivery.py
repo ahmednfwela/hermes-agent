@@ -1422,6 +1422,33 @@ def _maybe_wake_cron_target(
     return result.woke
 
 
+def _emit_cron_monitor_event(job: dict, output: str, *, adapters: Any = None, loop: Any = None) -> bool:
+    """Second, independent sink for ``no_agent`` monitor scripts: non-empty stdout becomes a
+    ``cron_monitor`` Event through the C2 event router regardless of ``deliver`` (so
+    ``deliver: local`` keeps the owner DM silent while a lead-facing wake still fires via jev
+    classification). Optional ``event_target: {platform, chat_id, thread_id?}`` names the lead
+    session; without one (or without a live adapter) the router records the event durably.
+    Additive and never raises. Returns True only on a confirmed wake."""
+    text = (output or "").strip()
+    if not job.get("no_agent") or not text or "[SILENT]" in text.upper()[:12]:
+        return False
+    try:
+        from gateway.event_router import Event, route_event
+        target = job.get("event_target") or {}
+        platform_name = str(target.get("platform") or "telegram")
+        adapter = (adapters or {}).get(platform_name) if isinstance(adapters, dict) else None
+        event = Event(
+            kind="cron_monitor", source=f"cron:{job.get('id', '?')}",
+            title=job.get("name") or job.get("id", "cron"), body=text,
+            metadata={"job_id": job.get("id")})
+        return route_event(
+            event, adapter=adapter, loop=loop, platform_name=platform_name,
+            chat_id=str(target.get("chat_id") or ""), thread_id=target.get("thread_id")).woke
+    except Exception:
+        logger.warning("Job '%s': cron_monitor event emit failed", job.get("id", "?"), exc_info=True)
+        return False
+
+
 def _seed_live_delivery_sessions(t: _TargetDelivery, delivered_message_id) -> None:
     """After a confirmed live send, seed continuation session(s) and run the generic mirror.
     Thread seeding is deferred here so open-succeeds/deliver-fails never seeds an unseen brief."""

@@ -2681,6 +2681,10 @@ def _save_compose_deliver(
     ) = _compose_run_delivery(
         job, success=d.success, error=d.error, final_response=final_response,
         output_file=output_file)
+    if d.success:
+        from cron.scheduler_delivery import _emit_cron_monitor_event
+
+        _emit_cron_monitor_event(job, final_response, adapters=adapters, loop=loop)
     # Whitespace-only == empty: skip delivery; the guard below marks it a soft failure.
     d.should_deliver = bool(deliver_content.strip()) and not _silent_alert
     if d.should_deliver and not d.success and job.get("_model_unreachable"):
