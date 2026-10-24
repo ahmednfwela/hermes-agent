@@ -43,12 +43,37 @@ TEXT_REJECTED_SELECTION = "rejected_selection"
 TEXT_NO_PENDING = "no_pending"
 
 
+def _coerce_choice(item, index: int) -> str:
+    """Coerce one registered choice to display text (boundary guard). Adapters build button
+    rows from str(choice); a non-string that survives registration renders a choices-bearing
+    clarify as a button-less card while the tool result still echoes the options. Unwrap
+    {label, description}-shaped dicts (LLM output drift) to 'label — description'; an item
+    with no usable label is rejected rather than stored — never half-arm a broken prompt."""
+    if isinstance(item, str):
+        return item
+    if isinstance(item, dict):
+        label = item.get("label")
+        description = item.get("description")
+        label = label.strip() if isinstance(label, str) else ""
+        description = description.strip() if isinstance(description, str) else ""
+        if label and description:
+            return f"{label} — {description}"
+        if label or description:
+            return label or description
+    raise ValueError(
+        f"clarify choices[{index}] is not a string and carries no 'label'/'description' "
+        f"text (got {type(item).__name__}); pass plain strings, or {{label, description}} objects")
+
+
 def register(clarify_id: str, session_key: str, question: str, choices: Optional[List[str]],
              multi_select: bool = False) -> _ClarifyEntry:
     """Register a pending clarify request; caller then blocks on ``wait_for_response``.
-    Open-ended (no choices) entries start in text mode: the next message IS the response."""
-    entry = _ClarifyEntry(clarify_id, session_key, question, list(choices) if choices else None,
-                          bool(multi_select) and bool(choices), awaiting_text=not bool(choices))
+    Open-ended (no choices) entries start in text mode: the next message IS the response.
+    Choices are coerced to plain strings here (_coerce_choice) so every adapter sees one
+    shape; a non-string with no label raises BEFORE the entry is stored."""
+    coerced = [_coerce_choice(c, i) for i, c in enumerate(choices)] if choices else None
+    entry = _ClarifyEntry(clarify_id, session_key, question, coerced,
+                          bool(multi_select) and bool(coerced), awaiting_text=not bool(coerced))
     with _lock:
         _entries[clarify_id] = entry
         _session_index.setdefault(session_key, []).append(clarify_id)
