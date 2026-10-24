@@ -1248,11 +1248,92 @@ def _resolve_job_workdir(job: dict, job_id: str) -> Optional[str]:
     return workdir
 
 
+def _emit_cron_monitor_event(job: dict, job_id: str, job_name: str, output: str, *,
+    adapters: Any = None, loop: Any = None) -> None:
+    """C2 cron_monitor sink (shared/misc/hermes-gateway-image#33, from
+    hermes-agent-cluster#1018): every non-empty no_agent stdout becomes exactly ONE
+    ``Event(kind='cron_monitor', source=f'cron:{job_id}', title=job_name, body=output)``
+    through ``gateway.event_router.route_event``, INDEPENDENT of the job's ``deliver``
+    value — a ``deliver: local`` job keeps the owner DM silent while the lead session
+    still gets its wake turn when jev classifies the text ALARM (ROUTINE events land in
+    the router's durable ledger; route_event never both wakes and records).
+
+    Deliberately fired BEFORE the wakeAgent gate (hac#1018: the gate suppresses the
+    AGENT turn / owner DM, it never suppresses a typed operational signal — a watchdog
+    that decides to stay quiet is still a signal worth triaging). The lead target is the
+    session the estate's owner-facing relays already use (``HERMES_LEAD_CLARIFY_CHAT_IDS``
+    / ``HERMES_CLARIFY_NOTIFY_CHAT_ID``; platform ``HERMES_LEAD_CLARIFY_CHAT_PLATFORM``,
+    default telegram): first entry wins — route_event wakes exactly one session per
+    event; ``all``/origin tokens are never legal here (an untagged broadcast wake was
+    round-1 review finding #1 on fork PR #3). When no lead target is configured the sink
+    skips with one info line — unconfigured-by-default, like the node-offline producer
+    (shared/misc/hermes-gateway-image#31). ``adapters``/``loop`` (the gateway's live
+    adapter map + loop, threaded through run_job) decide ALARM→wake vs ALARM→ledger; a
+    detached cron worker has neither and degrades to the ledger, never a crash. Every
+    failure is swallowed and logged — the router and its wake lane must NEVER become a
+    new way to break or delay a cron job's own delivery.
+    """
+    try:
+        lead_chat = (cron_env_setting("HERMES_CLARIFY_NOTIFY_CHAT_ID", "") or "").strip()
+        if not lead_chat:
+            lead_chat = ((cron_env_setting("HERMES_LEAD_CLARIFY_CHAT_IDS", "") or "")
+                         .split(",")[0].strip())
+        if not lead_chat:
+            logger.info("Job '%s' (no_agent): no lead wake target configured — "
+                        "skipping cron_monitor event", job_id)
+            return
+        platform_name = (cron_env_setting("HERMES_LEAD_CLARIFY_CHAT_PLATFORM", "")
+                         or "telegram").strip().lower()
+        from gateway.event_router import Event, route_event
+        # route_event takes the single live ADAPTER for the target platform + the gateway
+        # loop; `adapters` here is the gateway's platform->adapter map (same map cron
+        # delivery uses). No map (plain `hermes cron tick`, a test, a detached worker) ->
+        # adapter stays None and route_event records instead of waking. Thread/user come
+        # from the job's stored origin when the lead chat is a forum topic (mirrors the
+        # ballot-relay thread addressing, gwi#8).
+        adapter = None
+        if isinstance(adapters, dict):
+            # the gateway's adapter map is keyed by the Platform enum; tolerate plain
+            # string-keyed maps too (proofs/tests inject fakes).
+            try:
+                from gateway.config import Platform as _LeadPlatform
+                adapter = adapters.get(_LeadPlatform(platform_name))
+            except Exception:
+                adapter = None
+            if adapter is None:
+                for _key, _cand in adapters.items():
+                    if str(getattr(_key, "value", _key)).lower() == platform_name:
+                        adapter = _cand
+                        break
+        _origin = job.get("origin") if isinstance(job.get("origin"), dict) else {}
+        thread_id = None
+        if str(_origin.get("chat_id") or "") == lead_chat:
+            thread_id = _origin.get("thread_id")
+        result = route_event(
+            Event(kind="cron_monitor", source=f"cron:{job_id}",
+                  title=job_name, body=output,
+                  metadata={"job_id": job_id}),
+            platform_name=platform_name, chat_id=lead_chat,
+            thread_id=thread_id, adapter=adapter, loop=loop,
+        )
+        logger.info("Job '%s' (no_agent): cron_monitor routed (severity=%s woke=%s)",
+                    job_id, getattr(result, "severity", "?"),
+                    getattr(result, "woke", "?"))
+    except Exception as exc:
+        # Fail-soft: a router/wake-side failure must never break the job's own run —
+        # it still returns its delivery tuple for the normal path below.
+        logger.warning("Job '%s' (no_agent): cron_monitor emit failed (non-fatal): %s",
+                       job_id, exc)
+
+
 def _run_no_agent_job(
-    job: dict, job_id: str, job_name: str, cancel_event,
+    job: dict, job_id: str, job_name: str, cancel_event, *,
+    adapters: Any = None, loop: Any = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """no_agent short-circuit — the script IS the job (no AIAgent, no tokens). stdout → delivered
     verbatim; empty stdout or wakeAgent=false → silent success; non-zero exit/timeout → error alert.
+    Independent of delivery, non-empty stdout ALSO becomes one cron_monitor event for the lead
+    wake path (#33) — see _emit_cron_monitor_event.
     """
     # Load .env first so auto-delivery can resolve *_HOME_CHANNEL: the agent path's per-run dotenv
     # reload never runs for no_agent jobs. Does not override existing values.
@@ -1281,6 +1362,12 @@ def _run_no_agent_job(
 
     now_iso = _hermes_now().strftime("%Y-%m-%d %H:%M:%S")
     header = _job_doc_header(job_name, job_id, now_iso, "no_agent (script)")
+
+    # The cron monitor event fires BEFORE the wakeAgent gate and independent of `deliver`
+    # (#33, hermes-agent-cluster#1018): the lead gets a wake turn on any non-empty stdout.
+    if output.strip():
+        _emit_cron_monitor_event(job, job_id, job_name, output,
+                                  adapters=adapters, loop=loop)
 
     if not ok:
         # Deliver the error: a silently broken watchdog is the worst-case outcome.
@@ -1946,7 +2033,8 @@ _RunResult = tuple[bool, str, str, Optional[str]]
 
 
 def _prepare_job_prompt(
-    job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event,
+    job: dict, job_id: str, job_name: str, extra_prompt: Optional[str], cancel_event, *,
+    adapters: Any = None, loop: Any = None,
 ) -> tuple[Optional[_RunResult], Optional[str]]:
     """Run every pre-agent gate and build the prompt. Returns ``(early_result, prompt)``: an early
     result short-circuits ``run_job`` (no_agent job, empty payload, monitor gate, wake gate,
@@ -1964,7 +2052,8 @@ def _prepare_job_prompt(
 
     # no_agent short-circuits BEFORE importing run_agent / opening SessionDB.
     if job.get("no_agent"):
-        return _run_no_agent_job(job, job_id, job_name, cancel_event), None
+        return _run_no_agent_job(job, job_id, job_name, cancel_event,
+                                 adapters=adapters, loop=loop), None
 
     # Legacy / hand-edited job with nothing to run: pause it instead of waking the LLM every fire.
     from cron.jobs import EMPTY_PAYLOAD_ERROR, job_payload_is_empty
@@ -2241,6 +2330,7 @@ class _FireAudit:
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None, extra_prompt: Optional[str] = None,
     cancel_event: Optional[_CancelEventLike] = None, execution_id: Optional[str] = None,
+    adapters: Any = None, loop: Any = None,
 ) -> tuple[bool, str, str, Optional[str]]:
     """Execute a single cron job. Returns (success, full_output_doc, final_response, error).
     ``defer_agent_teardown``: if a list, the live agent is appended instead of torn down; the caller
@@ -2260,7 +2350,8 @@ def run_job(
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
 
-    early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event)
+    early, prompt = _prepare_job_prompt(job, job_id, job_name, extra_prompt, cancel_event,
+                                       adapters=adapters, loop=loop)
     if early is not None:
         return early
     from run_agent import AIAgent
@@ -2921,7 +3012,10 @@ def _run_one_job_body(
         _run_kwargs = {
             "defer_agent_teardown": _deferred_agents,
             "extra_prompt": extra_prompt,
-            "execution_id": execution_id}
+            "execution_id": execution_id,
+            # #33: the no_agent cron_monitor sink is the only consumer of these in run_job;
+            # the agent path ignores them (delivery resolves its own targets).
+            "adapters": adapters, "loop": loop}
         if fire_claim_lost is not None:
             _run_kwargs["cancel_event"] = fire_claim_lost
         try:
