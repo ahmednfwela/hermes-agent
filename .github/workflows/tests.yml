@@ -21,7 +21,21 @@ jobs:
     # 96 cores clear the floor that the slowest single test file sets (about
     # 82s). A second slice divides work that is already at that floor, and
     # adds a second setup.
-    runs-on: ubuntu-latest-96-core
+    #
+    # FORK OVERRIDE (ahmednfwela/hermes-agent only): `ubuntu-latest-96-core`
+    # is a GitHub-hosted Larger Runner SKU, gated on a paid plan (GitHub Team
+    # or Enterprise, or Pro for larger-runner access on a user account). This
+    # account is on the Free plan (`gh api user` -> `plan.name: "free"`) and
+    # has zero self-hosted runners registered (`actions/runners` ->
+    # `total_count: 0`), so a job requesting that label queues forever: no
+    # runner anywhere can ever claim it. Confirmed live on PR #3
+    # (job 108583838484): `status: "queued"`, `runner_id: 0` for 13+ hours.
+    # `all-checks-pass` (the repo's sole required status check, see ci.yaml)
+    # needs this job, so the stuck queue wedges every code-touching PR's
+    # auto-merge. Falling back to the standard free-tier runner here; see the
+    # matching HERMES_TEST_WORKERS override below (this job otherwise hangs
+    # onto the 96-core-tuned worker count on a much smaller box).
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout code
@@ -119,7 +133,13 @@ jobs:
           # across a 6x range. The suite has sufficient concurrency at this
           # size. The remaining time is the slowest files plus the setup.
           # Workers above the core count only add contention.
-          HERMES_TEST_WORKERS: 96
+          #
+          # FORK OVERRIDE (ahmednfwela/hermes-agent only): this account runs
+          # `ubuntu-latest`, not the 96-core runner above, so `HERMES_TEST_WORKERS: 96`
+          # is left UNSET here on purpose. scripts/run_tests_parallel.py's own
+          # default (`os.cpu_count() or 4) * 2`) auto-scales to whatever this
+          # runner actually has, instead of hardcoding a number tuned for a
+          # runner class this account cannot use.
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""

@@ -20,7 +20,14 @@ jobs:
     # This job builds the renderer and the electron bundle, then drives a real
     # Electron app under xvfb. vite, tsc and the Playwright workers all scale
     # with the core count.
-    runs-on: ubuntu-latest-32-core
+    #
+    # FORK OVERRIDE (ahmednfwela/hermes-agent only): `ubuntu-latest-32-core`
+    # is a paid-plan-gated Larger Runner SKU this account cannot use (see
+    # tests.yml for the full root cause — it wedges `all-checks-pass`, the
+    # repo's sole required status check, by queuing forever). vite/tsc/
+    # Playwright auto-size from the core count, so the standard runner needs
+    # no other change.
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
       review_status: ${{ steps.review-status.outputs.review_status }}

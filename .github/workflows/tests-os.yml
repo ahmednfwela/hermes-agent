@@ -61,7 +61,15 @@ jobs:
             runner: macos-latest
             marker: macos_only
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            # FORK OVERRIDE (ahmednfwela/hermes-agent only): `windows-latest-32-core`
+            # is a paid-plan-gated Larger Runner SKU this account (Free plan,
+            # no self-hosted runners) can never satisfy — it queues forever
+            # (confirmed live on PR #3, job 108583838460: `status: "queued"`,
+            # `runner_id: 0` for 13+ hours), wedging `all-checks-pass` (the
+            # repo's sole required status check) on every code-touching PR.
+            # This lane is a single unmarshalled `pytest` process (see the
+            # header comment above), so the standard runner is plenty.
+            runner: windows-latest
             marker: windows_only
     steps:
       - name: Checkout code
