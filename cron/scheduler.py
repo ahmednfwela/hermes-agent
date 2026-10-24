@@ -2683,6 +2683,17 @@ def _save_compose_deliver(
         output_file=output_file)
     # Whitespace-only == empty: skip delivery; the guard below marks it a soft failure.
     d.should_deliver = bool(deliver_content.strip()) and not _silent_alert
+
+    # Determine whether to suppress delivery based on notify mode
+    notify_mode = job.get("notify", "always")
+    if d.should_deliver and d.success and notify_mode == "never":
+        logger.info("Job '%s': notify=never — skipping delivery", job["id"])
+        d.should_deliver = False
+    elif d.should_deliver and d.success and notify_mode == "changes_only":
+        if deliver_content.strip().upper().startswith(SILENT_MARKER):
+            logger.info("Job '%s': agent returned %s — skipping delivery", job["id"], SILENT_MARKER)
+            d.should_deliver = False
+
     if d.should_deliver and not d.success and job.get("_model_unreachable"):
         # The model was never reached and a bounded automatic re-run will be scheduled
         # (cron/unreachable_retry.py): hold the failure notice — the re-run either

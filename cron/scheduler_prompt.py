@@ -215,6 +215,19 @@ def _build_job_prompt(
     if extra_prompt:
         user_prompt = f"{user_prompt}\n\n## Run Context\n{extra_prompt}"
     prompt = user_prompt
+
+    # When notify=changes_only, prepend guidance so the cron agent knows
+    # it can suppress delivery by starting its response with [SILENT].
+    notify = job.get("notify", "always")
+    if notify == "changes_only":
+        silent_hint = (
+            "[SYSTEM: This job uses notify=changes_only. If you have nothing new "
+            "or noteworthy to report, respond with exactly \"[SILENT]\" (optionally "
+            "followed by a brief internal note). This suppresses delivery to the "
+            "user while still saving output locally. Only use [SILENT] when there "
+            "are genuinely no changes worth reporting.]\n\n"
+        )
+        prompt = silent_hint + prompt
     # Runtime DATA (script stdout, upstream output) legitimately quotes command-shape strings, so it
     # must not be scanned with the strict user-prompt set — see _scan_assembled_cron_prompt.
     has_injected_data = False
