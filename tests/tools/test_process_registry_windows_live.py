@@ -101,3 +101,79 @@ class TestWindowsSpawnParity:
         result = registry.kill_process(session.id)
         assert result.get("status") in {"killed", "already_exited"}
         assert session.systemd_unit == ""
+
+    def test_kill_process_reaps_msys_background_descendant(self, registry):
+        """shared/claude-plugins#1042 / #1052: an MSYS/Cygwin background (``&``)
+        child is reparented to a Cygwin-internal process the moment it is
+        spawned -- it never appears under the outer bash's PID in Windows' own
+        ParentProcessId table. ``taskkill /PID <pid> /T /F`` (the pre-fix
+        mechanism) walks that table and returns SUCCESS on the outer bash while
+        the background child keeps running untouched -- this was OmniRoute's
+        ``npm run dev`` tree surviving ``agent_close`` on live Hermes.
+
+        The fix assigns the outer process to a Windows Job Object with
+        ``JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`` at spawn time; job membership
+        propagates through process creation / handle inheritance and is
+        independent of the (broken) ParentProcessId link, so closing the job
+        handle must reap the descendant even though it was never a "child" in
+        the sense ``taskkill /T`` can see.
+
+        Identification of the descendant is via Cygwin's own
+        ``/proc/<msys-pid>/winpid`` (the real Windows PID), not by scanning
+        the process table by name+recency -- this machine runs other
+        concurrent sessions whose own ``sleep.exe``/similar processes would
+        otherwise contaminate the match. It is tagged with a ``WINPID:``
+        marker in the captured output rather than matched as a bare number --
+        an early draft of this test matched the first digit run in the
+        buffer and silently captured the ``[1] <job-number>`` bash prints
+        when it announces the background job (bash runs ``-lic`` here with no
+        tty, so job control is off and it prints "no job control in this
+        shell" ahead of the real output) instead of the real winpid, which
+        made the assertions below pass VACUOUSLY (pid 1 doesn't exist on
+        Windows, so both "ppid mismatch" and "pid gone after kill" were
+        trivially true for the wrong pid, not evidence of anything).
+        """
+        import re
+
+        import psutil
+
+        session = registry.spawn_local(
+            'sleep 600 >/dev/null 2>&1 & p=$!; printf "WINPID:%s\\n" "$(cat /proc/$p/winpid)"; sleep 300'
+        )
+
+        deadline = time.time() + 10
+        winpid = None
+        while time.time() < deadline:
+            m = re.search(r"WINPID:(\d+)", session.output_buffer)
+            if m:
+                winpid = int(m.group(1))
+                break
+            time.sleep(0.1)
+        assert winpid is not None, (
+            f"never saw the background child's winpid in output: {session.output_buffer!r}"
+        )
+
+        # Confirm this really reproduces the MSYS-reparenting escape (and isn't
+        # accidentally testing a normal, PPID-visible child): the descendant's
+        # real Windows PPID must NOT be the outer bash pid process_registry
+        # recorded as session.pid.
+        try:
+            child_ppid = psutil.Process(winpid).ppid()
+        except psutil.NoSuchProcess:
+            child_ppid = None
+        assert child_ppid != session.pid, (
+            "test setup did not reproduce the MSYS reparenting escape -- the "
+            f"background child's PPID unexpectedly IS the outer bash pid ({session.pid}); "
+            "this test is meaningless without that escape shape"
+        )
+
+        result = registry.kill_process(session.id)
+        assert result.get("status") in {"killed", "already_exited"}
+
+        deadline = time.time() + 10
+        while time.time() < deadline and psutil.pid_exists(winpid):
+            time.sleep(0.2)
+        assert not psutil.pid_exists(winpid), (
+            f"MSYS background descendant (winpid={winpid}) survived kill_process() -- "
+            "taskkill /T's ParentProcessId walk missed it (shared/claude-plugins#1042/#1052)"
+        )
